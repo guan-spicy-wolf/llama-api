@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>llama-api Control Panel</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            padding: 2rem;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { margin-bottom: 1rem; color: #4ecca3; }
+        h2 { margin: 1.5rem 0 1rem; color: #4ecca3; font-size: 1.2rem; }
+        .card {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+        .status-running { background: #059669; }
+        .status-stopped { background: #6b7280; }
+        .status-error { background: #dc2626; }
+        .model-list { list-style: none; }
+        .model-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem;
+            margin: 0.5rem 0;
+            background: #1a1a2e;
+            border-radius: 6px;
+        }
+        .model-item:hover { background: #0f3460; }
+        button {
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: #4ecca3; color: #1a1a2e; }
+        .btn-primary:hover { background: #3db892; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn-danger:hover { background: #b91c1c; }
+        .btn-secondary { background: #4b5563; color: white; }
+        .btn-secondary:hover { background: #374151; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .info { color: #9ca3af; font-size: 0.875rem; margin-top: 0.5rem; }
+        .error { color: #f87171; margin-top: 0.5rem; }
+        .refresh-btn { float: right; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>llama-api Control Panel</h1>
+
+        <div class="card">
+            <h2>Server Status</h2>
+            <div id="status-content">
+                <span class="status-badge status-stopped">Loading...</span>
+            </div>
+            <div id="status-info" class="info"></div>
+            <div style="margin-top: 1rem;">
+                <button id="unload-btn" class="btn btn-danger" onclick="unloadModel()" disabled>Unload Model</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Available Models
+                <button class="btn btn-secondary refresh-btn" onclick="loadModels()">Refresh</button>
+            </h2>
+            <ul id="model-list" class="model-list">
+                <li class="info">Loading models...</li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        let currentStatus = null;
+
+        async function loadStatus() {
+            try {
+                const resp = await fetch('/api/server/status');
+                currentStatus = await resp.json();
+                updateStatusUI();
+            } catch (e) {
+                document.getElementById('status-content').innerHTML =
+                    '<span class="status-badge status-error">Error</span>';
+                document.getElementById('status-info').textContent = e.message;
+            }
+        }
+
+        function updateStatusUI() {
+            const status = currentStatus;
+            const statusEl = document.getElementById('status-content');
+            const infoEl = document.getElementById('status-info');
+            const unloadBtn = document.getElementById('unload-btn');
+
+            let badgeClass = 'status-stopped';
+            if (status.status === 'running') badgeClass = 'status-running';
+            else if (status.status === 'error') badgeClass = 'status-error';
+
+            statusEl.innerHTML = `<span class="status-badge ${badgeClass}">${status.status}</span>`;
+
+            if (status.status === 'running') {
+                infoEl.textContent = `Model: ${status.model} | PID: ${status.pid} | Port: ${status.port}`;
+                unloadBtn.disabled = false;
+            } else if (status.error) {
+                infoEl.textContent = status.error;
+                unloadBtn.disabled = true;
+            } else {
+                infoEl.textContent = 'No model loaded';
+                unloadBtn.disabled = true;
+            }
+        }
+
+        async function loadModels() {
+            try {
+                const resp = await fetch('/api/models');
+                const models = await resp.json();
+                const listEl = document.getElementById('model-list');
+
+                if (models.length === 0) {
+                    listEl.innerHTML = '<li class="info">No models configured. Add config files to /var/containers/llama-api/models.d/</li>';
+                    return;
+                }
+
+                listEl.innerHTML = models.map(m => `
+                    <li class="model-item">
+                        <div>
+                            <strong>${m.name}</strong>
+                            <div class="info">${m.file}</div>
+                        </div>
+                        <button class="btn btn-primary" onclick="loadModel('${m.name}')">Load</button>
+                    </li>
+                `).join('');
+            } catch (e) {
+                document.getElementById('model-list').innerHTML =
+                    `<li class="error">Failed to load models: ${e.message}</li>`;
+            }
+        }
+
+        async function loadModel(name) {
+            try {
+                const resp = await fetch('/api/server/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: name })
+                });
+
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    throw new Error(err.detail || 'Failed to load model');
+                }
+
+                await loadStatus();
+                alert(`Model '${name}' loaded successfully`);
+            } catch (e) {
+                alert(`Error: ${e.message}`);
+            }
+        }
+
+        async function unloadModel() {
+            try {
+                const resp = await fetch('/api/server/unload', { method: 'POST' });
+                if (!resp.ok) throw new Error('Failed to unload');
+                await loadStatus();
+            } catch (e) {
+                alert(`Error: ${e.message}`);
+            }
+        }
+
+        // Initial load
+        loadStatus();
+        loadModels();
+
+        // Auto-refresh status
+        setInterval(loadStatus, 5000);
+    </script>
+</body>
+</html>
