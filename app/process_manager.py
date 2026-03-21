@@ -1,12 +1,25 @@
 """Process manager for llama-server."""
 import asyncio
 import os
+import socket
 import time
 from pathlib import Path
 from typing import Optional
 
 from .models import ServerStatus, ServerInfo
 from .config import get_config
+
+
+def find_free_port(start_port: int = 18080, max_tries: int = 100) -> int:
+    """Find a free port starting from start_port."""
+    for port in range(start_port, start_port + max_tries):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError("No free port found")
 
 
 class ProcessManager:
@@ -66,7 +79,8 @@ class ProcessManager:
 
         # Get effective args
         args = config.get_effective_args(model_name)
-        self._port = port or config.default_port
+        # Use internal port (auto-assign if not specified)
+        self._port = find_free_port()
         self._model = model_name
         self._error = None
 
@@ -74,6 +88,7 @@ class ProcessManager:
         cmd = [
             str(config.llama_server),
             "-m", str(model_path),
+            "--alias", model_name,
             "--port", str(self._port),
             "--host", "0.0.0.0",
         ]

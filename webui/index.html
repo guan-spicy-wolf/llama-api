@@ -57,10 +57,95 @@
         .btn-danger:hover { background: #b91c1c; }
         .btn-secondary { background: #4b5563; color: white; }
         .btn-secondary:hover { background: #374151; }
+        .btn-copy { background: #3b82f6; color: white; padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+        .btn-copy:hover { background: #2563eb; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .info { color: #9ca3af; font-size: 0.875rem; margin-top: 0.5rem; }
         .error { color: #f87171; margin-top: 0.5rem; }
         .refresh-btn { float: right; }
+        .model-id-box {
+            background: #0f3460;
+            padding: 0.75rem 1rem;
+            border-radius: 6px;
+            margin-top: 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-family: monospace;
+        }
+        .model-id-box code { flex: 1; color: #4ecca3; }
+        .api-example {
+            background: #0f0f1a;
+            padding: 0.75rem 1rem;
+            border-radius: 6px;
+            margin-top: 0.75rem;
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: #9ca3af;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .copied-toast {
+            position: fixed;
+            bottom: 2rem;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #059669;
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .copied-toast.show { opacity: 1; }
+
+        /* Metrics styles */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1rem;
+        }
+        @media (max-width: 600px) {
+            .metrics-grid { grid-template-columns: 1fr; }
+        }
+        .metric-item {
+            background: #1a1a2e;
+            padding: 1rem;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .metric-label {
+            font-size: 0.75rem;
+            color: #9ca3af;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+        }
+        .metric-value {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #4ecca3;
+        }
+        .metric-bar {
+            height: 4px;
+            background: #0f3460;
+            border-radius: 2px;
+            margin-top: 0.5rem;
+            overflow: hidden;
+        }
+        .metric-bar-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.5s ease;
+        }
+        .metric-bar-low { background: #059669; }
+        .metric-bar-mid { background: #d97706; }
+        .metric-bar-high { background: #dc2626; }
+        .metric-detail {
+            font-size: 0.75rem;
+            color: #6b7280;
+            margin-top: 0.25rem;
+        }
     </style>
 </head>
 <body>
@@ -68,11 +153,35 @@
         <h1>llama-api Control Panel</h1>
 
         <div class="card">
+            <h2>System Metrics</h2>
+            <div id="metrics-content" class="metrics-grid">
+                <div class="metric-item">
+                    <div class="metric-label">CPU</div>
+                    <div class="metric-value" id="cpu-value">--</div>
+                    <div class="metric-bar"><div class="metric-bar-fill" id="cpu-bar" style="width: 0%"></div></div>
+                </div>
+                <div class="metric-item">
+                    <div class="metric-label">Memory</div>
+                    <div class="metric-value" id="mem-value">--</div>
+                    <div class="metric-bar"><div class="metric-bar-fill" id="mem-bar" style="width: 0%"></div></div>
+                    <div class="metric-detail" id="mem-detail">-- / -- GB</div>
+                </div>
+                <div class="metric-item">
+                    <div class="metric-label">GPU VRAM</div>
+                    <div class="metric-value" id="gpu-value">--</div>
+                    <div class="metric-bar"><div class="metric-bar-fill" id="gpu-bar" style="width: 0%"></div></div>
+                    <div class="metric-detail" id="gpu-detail">-- / -- GB</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
             <h2>Server Status</h2>
             <div id="status-content">
                 <span class="status-badge status-stopped">Loading...</span>
             </div>
             <div id="status-info" class="info"></div>
+            <div id="model-id-section"></div>
             <div style="margin-top: 1rem;">
                 <button id="unload-btn" class="btn btn-danger" onclick="unloadModel()" disabled>Unload Model</button>
             </div>
@@ -88,8 +197,67 @@
         </div>
     </div>
 
+    <div id="copied-toast" class="copied-toast">Copied!</div>
+
     <script>
         let currentStatus = null;
+
+        function getBarClass(percent) {
+            if (percent < 60) return 'metric-bar-low';
+            if (percent < 85) return 'metric-bar-mid';
+            return 'metric-bar-high';
+        }
+
+        async function loadMetrics() {
+            try {
+                const resp = await fetch('/api/server/metrics');
+                const data = await resp.json();
+
+                // CPU
+                const cpuPercent = data.cpu.percent;
+                document.getElementById('cpu-value').textContent = cpuPercent.toFixed(1) + '%';
+                const cpuBar = document.getElementById('cpu-bar');
+                cpuBar.style.width = cpuPercent + '%';
+                cpuBar.className = 'metric-bar-fill ' + getBarClass(cpuPercent);
+
+                // Memory
+                const memPercent = data.memory.percent;
+                document.getElementById('mem-value').textContent = memPercent.toFixed(1) + '%';
+                document.getElementById('mem-detail').textContent =
+                    `${data.memory.used_gb} / ${data.memory.total_gb} GB` +
+                    (data.memory.process_gb > 0 ? ` (model: ${data.memory.process_gb} GB)` : '');
+                const memBar = document.getElementById('mem-bar');
+                memBar.style.width = memPercent + '%';
+                memBar.className = 'metric-bar-fill ' + getBarClass(memPercent);
+
+                // GPU
+                if (data.gpu) {
+                    const gpuPercent = data.gpu.percent;
+                    document.getElementById('gpu-value').textContent = gpuPercent.toFixed(1) + '%';
+                    document.getElementById('gpu-detail').textContent =
+                        `${data.gpu.used_gb} / ${data.gpu.total_gb} GB`;
+                    const gpuBar = document.getElementById('gpu-bar');
+                    gpuBar.style.width = gpuPercent + '%';
+                    gpuBar.className = 'metric-bar-fill ' + getBarClass(gpuPercent);
+                } else {
+                    document.getElementById('gpu-value').textContent = 'N/A';
+                    document.getElementById('gpu-detail').textContent = 'ROCm not available';
+                }
+            } catch (e) {
+                console.error('Failed to load metrics:', e);
+            }
+        }
+
+        function showToast(msg = 'Copied!') {
+            const toast = document.getElementById('copied-toast');
+            toast.textContent = msg;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 1500);
+        }
+
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => showToast());
+        }
 
         async function loadStatus() {
             try {
@@ -107,6 +275,7 @@
             const status = currentStatus;
             const statusEl = document.getElementById('status-content');
             const infoEl = document.getElementById('status-info');
+            const modelIdSection = document.getElementById('model-id-section');
             const unloadBtn = document.getElementById('unload-btn');
 
             let badgeClass = 'status-stopped';
@@ -116,13 +285,40 @@
             statusEl.innerHTML = `<span class="status-badge ${badgeClass}">${status.status}</span>`;
 
             if (status.status === 'running') {
-                infoEl.textContent = `Model: ${status.model} | PID: ${status.pid} | Port: ${status.port}`;
+                infoEl.textContent = `PID: ${status.pid}`;
                 unloadBtn.disabled = false;
+
+                const baseUrl = window.location.origin;
+                modelIdSection.innerHTML = `
+                    <div class="model-id-box">
+                        <span style="color: #9ca3af;">Model ID:</span>
+                        <code>${status.model}</code>
+                        <button class="btn btn-copy" onclick="copyToClipboard('${status.model}')">Copy</button>
+                    </div>
+                    <div class="api-example">
+<span style="color: #4ecca3;"># API Endpoint:</span>
+${baseUrl}/v1/chat/completions
+
+<span style="color: #4ecca3;"># Example:</span>
+curl ${baseUrl}/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "${status.model}", "messages": [{"role": "user", "content": "Hello"}]}'
+
+<span style="color: #4ecca3;"># Python:</span>
+from openai import OpenAI
+client = OpenAI(base_url="${baseUrl}/v1", api_key="none")
+response = client.chat.completions.create(
+    model="${status.model}",
+    messages=[{"role": "user", "content": "Hello"}]
+)</div>
+                `;
             } else if (status.error) {
                 infoEl.textContent = status.error;
+                modelIdSection.innerHTML = '';
                 unloadBtn.disabled = true;
             } else {
                 infoEl.textContent = 'No model loaded';
+                modelIdSection.innerHTML = '';
                 unloadBtn.disabled = true;
             }
         }
@@ -167,7 +363,6 @@
                 }
 
                 await loadStatus();
-                alert(`Model '${name}' loaded successfully`);
             } catch (e) {
                 alert(`Error: ${e.message}`);
             }
@@ -184,10 +379,12 @@
         }
 
         // Initial load
+        loadMetrics();
         loadStatus();
         loadModels();
 
-        // Auto-refresh status
+        // Auto-refresh
+        setInterval(loadMetrics, 5000);
         setInterval(loadStatus, 5000);
     </script>
 </body>
