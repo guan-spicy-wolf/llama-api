@@ -1,5 +1,6 @@
 """Process manager for llama-server."""
 import asyncio
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -83,11 +84,21 @@ class ProcessManager:
             arg_name = key.replace("_", "-")
             cmd.extend([f"--{arg_name}", str(value)])
 
+        # Prepare environment
+        env = os.environ.copy()
+        if config.ld_library_path:
+            current_ld = env.get("LD_LIBRARY_PATH", "")
+            if current_ld:
+                env["LD_LIBRARY_PATH"] = f"{config.ld_library_path}:{current_ld}"
+            else:
+                env["LD_LIBRARY_PATH"] = config.ld_library_path
+
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             self._started_at = time.time()
 

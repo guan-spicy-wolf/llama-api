@@ -8,5 +8,5 @@
 - [x] Task 6: API 路由 - 服务器控制
 - [x] Task 7: FastAPI 主入口
 - [x] Task 8: WebUI
-- [ ] Task 9: 示例配置文件
+- [x] Task 9: 示例配置文件
 - [ ] Task 10: 初始化运行目录并测试

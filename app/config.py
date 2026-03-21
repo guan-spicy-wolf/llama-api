@@ -20,6 +20,7 @@ class Config:
         self.models_dir = DEFAULT_MODELS_DIR
         self.llama_server = Path.home() / "llama.cpp/rocm/bin/llama-server"
         self.default_port = 8080
+        self.ld_library_path: Optional[str] = None
         self._load_main_config()
         self._model_configs: dict[str, ModelConfig] = {}
         self._load_model_configs()
@@ -36,6 +37,8 @@ class Config:
                 self.llama_server = Path(data["llama_server"])
             if "default_port" in data:
                 self.default_port = data["default_port"]
+            if "ld_library_path" in data:
+                self.ld_library_path = data["ld_library_path"]
 
     def _load_model_configs(self) -> None:
         """Load all model configuration files from models.d/."""

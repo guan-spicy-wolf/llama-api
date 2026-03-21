@@ -4,6 +4,9 @@
 # llama-server 可执行文件路径
 llama_server: /home/holo/llama.cpp/rocm/bin/llama-server
 
+# 动态库路径（llama.cpp 的 lib 目录）
+ld_library_path: /home/holo/llama.cpp/rocm/bin
+
 # 模型文件目录
 models_dir: /var/models
 
