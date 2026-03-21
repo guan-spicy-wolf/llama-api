@@ -1,0 +1,11 @@
+# llama-api 配置文件示例
+# 复制到 /var/containers/llama-api/config.yaml
+
+# llama-server 可执行文件路径
+llama_server: /home/holo/llama.cpp/rocm/bin/llama-server
+
+# 模型文件目录
+models_dir: /var/models
+
+# 默认端口
+default_port: 8080

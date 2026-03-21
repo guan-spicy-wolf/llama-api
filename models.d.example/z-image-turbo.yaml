@@ -1,0 +1,7 @@
+# 示例模型配置 - 较小模型
+name: z-image-turbo
+file: z-image-turbo-Q4_K_M.gguf
+args:
+  ctx_size: 8192
+  n_gpu_layers: 99
+  threads: 8

@@ -1,0 +1,9 @@
+# 示例模型配置
+# 放置在 /var/containers/llama-api/models.d/ 目录下
+
+name: minimax
+file: MiniMax-139B-Merged.gguf
+args:
+  ctx_size: 4096
+  n_gpu_layers: 99
+  threads: 8
