@@ -9,4 +9,4 @@
 - [x] Task 7: FastAPI 主入口
 - [x] Task 8: WebUI
 - [x] Task 9: 示例配置文件
-- [ ] Task 10: 初始化运行目录并测试
+- [x] Task 10: 初始化运行目录并测试
