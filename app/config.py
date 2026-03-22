@@ -21,6 +21,9 @@ class Config:
         self.llama_server = Path.home() / "llama.cpp/rocm/bin/llama-server"
         self.default_port = 8080
         self.ld_library_path: Optional[str] = None
+        self.default_idle_timeout: int = 300  # 5 minutes
+        self.data_dir = self.config_dir
+        self.routing_file = self.data_dir / "routing.json"
         self._load_main_config()
         self._model_configs: dict[str, ModelConfig] = {}
         self._load_model_configs()
@@ -39,6 +42,8 @@ class Config:
                 self.default_port = data["default_port"]
             if "ld_library_path" in data:
                 self.ld_library_path = data["ld_library_path"]
+            if "default_idle_timeout" in data:
+                self.default_idle_timeout = data["default_idle_timeout"]
 
     def _load_model_configs(self) -> None:
         """Load all model configuration files from models.d/."""
@@ -155,4 +160,6 @@ def init_config(config_dir: Optional[Path] = None) -> Config:
     """Initialize global config instance."""
     global _config
     _config = Config(config_dir)
+    # Ensure data directory exists
+    _config.data_dir.mkdir(parents=True, exist_ok=True)
     return _config
