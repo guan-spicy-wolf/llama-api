@@ -1,12 +1,14 @@
 """Process manager for llama-server."""
 import asyncio
+import json
 import os
 import socket
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
-from .models import ServerStatus, ServerInfo
+from .models import ProcessInfo
 from .config import get_config
 
 
@@ -22,47 +24,73 @@ def find_free_port(start_port: int = 18080, max_tries: int = 100) -> int:
     raise RuntimeError("No free port found")
 
 
+def get_available_memory_gb() -> float:
+    """Get available system memory in GB."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except Exception:
+        pass
+    # Fallback
+    import psutil
+    return psutil.virtual_memory().available / (1024 ** 3)
+
+
+def estimate_model_memory_gb(model_path: Path) -> float:
+    """Estimate model memory requirement from file size."""
+    # GGUF file size is roughly the memory needed
+    return model_path.stat().st_size / (1024 ** 3)
+
+
+@dataclass
+class RunningModel:
+    """Runtime state for a loaded model."""
+    process: asyncio.subprocess.Process
+    port: int
+    model: str
+    started_at: float
+    last_used_at: float
+    idle_timeout: int
+
+    def to_persist(self) -> dict:
+        """Get persistable state (without process object)."""
+        return {
+            "port": self.port,
+            "pid": self.process.pid,
+            "model": self.model,
+            "started_at": self.started_at,
+            "last_used_at": self.last_used_at,
+            "idle_timeout": self.idle_timeout,
+        }
+
+
 class ProcessManager:
-    """Manages llama-server process lifecycle."""
+    """Manages multiple llama-server processes."""
 
     def __init__(self):
-        self._process: Optional[asyncio.subprocess.Process] = None
-        self._model: Optional[str] = None
-        self._port: Optional[int] = None
-        self._started_at: Optional[float] = None
-        self._error: Optional[str] = None
-        self._stdout_task: Optional[asyncio.Task] = None
-        self._stderr_task: Optional[asyncio.Task] = None
+        self._processes: Dict[str, RunningModel] = {}
+        self._idle_task: Optional[asyncio.Task] = None
+        self._stdout_tasks: Dict[str, asyncio.Task] = {}
+        self._stderr_tasks: Dict[str, asyncio.Task] = {}
 
     @property
-    def status(self) -> ServerInfo:
-        """Get current server status."""
-        if self._error:
-            return ServerInfo(
-                status=ServerStatus.ERROR,
-                model=self._model,
-                error=self._error,
-            )
+    def processes(self) -> Dict[str, RunningModel]:
+        """Get all running processes."""
+        return self._processes
 
-        if self._process is None:
-            return ServerInfo(status=ServerStatus.STOPPED)
+    def get_model(self, model_name: str) -> Optional[RunningModel]:
+        """Get a specific model's process info."""
+        return self._processes.get(model_name)
 
-        if self._process.returncode is not None:
-            return ServerInfo(
-                status=ServerStatus.STOPPED,
-                model=self._model,
-                error=f"Process exited with code {self._process.returncode}",
-            )
+    def touch_model(self, model_name: str) -> None:
+        """Update last_used_at for a model."""
+        if model_name in self._processes:
+            self._processes[model_name].last_used_at = time.time()
+            self._save_routing()
 
-        return ServerInfo(
-            status=ServerStatus.RUNNING,
-            model=self._model,
-            pid=self._process.pid,
-            port=self._port,
-            started_at=self._started_at,
-        )
-
-    async def start(self, model_name: str, port: Optional[int] = None) -> ServerInfo:
+    async def start(self, model_name: str) -> ProcessInfo:
         """Start llama-server with specified model."""
         config = get_config()
         model_config = config.get_model_config(model_name)
@@ -70,30 +98,46 @@ class ProcessManager:
         if not model_config:
             raise ValueError(f"Model '{model_name}' not found")
 
-        if self._process and self._process.returncode is None:
-            raise RuntimeError(f"Server already running with model '{self._model}'")
+        if model_name in self._processes:
+            proc = self._processes[model_name]
+            if proc.process.returncode is None:
+                raise RuntimeError(f"Model '{model_name}' is already running")
+            else:
+                # Clean up dead process
+                del self._processes[model_name]
 
         model_path = config.models_dir / model_config.file
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
-        # Get effective args
-        args = config.get_effective_args(model_name)
-        # Use internal port (auto-assign if not specified)
-        self._port = find_free_port()
-        self._model = model_name
-        self._error = None
+        # Memory check
+        available = get_available_memory_gb()
+        required = estimate_model_memory_gb(model_path)
+        if required > available * 0.8:
+            raise MemoryError(
+                f"Not enough memory to load '{model_name}': "
+                f"need ~{required:.1f}GB, only {available:.1f}GB available"
+            )
+
+        # Get idle timeout
+        idle_timeout = model_config.idle_timeout or config.default_idle_timeout
+
+        # Find port
+        used_ports = {p.port for p in self._processes.values()}
+        port = find_free_port()
+        while port in used_ports:
+            port = find_free_port(port + 1)
 
         # Build command
+        args = config.get_effective_args(model_name)
         cmd = [
             str(config.llama_server),
             "-m", str(model_path),
             "--alias", model_name,
-            "--port", str(self._port),
+            "--port", str(port),
             "--host", "0.0.0.0",
         ]
 
-        # Add model args
         args_dict = args.model_dump(exclude_unset=True, exclude_none=True)
         for key, value in args_dict.items():
             arg_name = key.replace("_", "-")
@@ -109,73 +153,155 @@ class ProcessManager:
                 env["LD_LIBRARY_PATH"] = config.ld_library_path
 
         try:
-            self._process = await asyncio.create_subprocess_exec(
+            process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
-            self._started_at = time.time()
 
-            # Start output readers (non-blocking)
-            self._stdout_task = asyncio.create_task(self._read_stdout())
-            self._stderr_task = asyncio.create_task(self._read_stderr())
-
-            # Wait a moment to check if process starts successfully
+            # Wait briefly to check immediate failure
             await asyncio.sleep(0.5)
+            if process.returncode is not None:
+                raise RuntimeError(f"Process exited immediately with code {process.returncode}")
 
-            if self._process.returncode is not None:
-                raise RuntimeError(f"Process exited immediately with code {self._process.returncode}")
+            now = time.time()
+            self._processes[model_name] = RunningModel(
+                process=process,
+                port=port,
+                model=model_name,
+                started_at=now,
+                last_used_at=now,
+                idle_timeout=idle_timeout,
+            )
 
-            return self.status
+            # Start output readers
+            self._stdout_tasks[model_name] = asyncio.create_task(
+                self._read_stdout(model_name)
+            )
+            self._stderr_tasks[model_name] = asyncio.create_task(
+                self._read_stderr(model_name)
+            )
+
+            # Start idle checker if not running
+            if self._idle_task is None or self._idle_task.done():
+                self._idle_task = asyncio.create_task(self._idle_checker())
+
+            self._save_routing()
+
+            return ProcessInfo(
+                port=port,
+                pid=process.pid,
+                model=model_name,
+                started_at=now,
+                last_used_at=now,
+                idle_timeout=idle_timeout,
+            )
 
         except Exception as e:
-            self._error = str(e)
-            self._process = None
             raise
 
-    async def stop(self) -> ServerInfo:
-        """Stop llama-server."""
-        if self._process is None or self._process.returncode is not None:
-            return ServerInfo(status=ServerStatus.STOPPED)
+    async def unload(self, model_name: str) -> bool:
+        """Unload a specific model."""
+        if model_name not in self._processes:
+            return False
+
+        rm = self._processes[model_name]
 
         try:
-            self._process.terminate()
-            await asyncio.wait_for(self._process.wait(), timeout=10)
-        except asyncio.TimeoutError:
-            self._process.kill()
-            await self._process.wait()
-        finally:
-            if self._stdout_task:
-                self._stdout_task.cancel()
-            if self._stderr_task:
-                self._stderr_task.cancel()
-            self._process = None
-            self._model = None
-            self._port = None
-            self._started_at = None
+            if rm.process.returncode is None:
+                rm.process.terminate()
+                try:
+                    await asyncio.wait_for(rm.process.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    rm.process.kill()
+                    await rm.process.wait()
+        except ProcessLookupError:
+            pass
 
-        return ServerInfo(status=ServerStatus.STOPPED)
+        # Clean up
+        del self._processes[model_name]
+        if model_name in self._stdout_tasks:
+            self._stdout_tasks[model_name].cancel()
+            del self._stdout_tasks[model_name]
+        if model_name in self._stderr_tasks:
+            self._stderr_tasks[model_name].cancel()
+            del self._stderr_tasks[model_name]
 
-    async def _read_stdout(self) -> None:
-        """Read and log stdout."""
-        if not self._process or not self._process.stdout:
+        self._save_routing()
+        return True
+
+    async def unload_all(self) -> None:
+        """Unload all models."""
+        for model_name in list(self._processes.keys()):
+            await self.unload(model_name)
+
+    async def _idle_checker(self):
+        """Background task to check for idle models."""
+        while True:
+            await asyncio.sleep(60)  # Check every minute
+            now = time.time()
+            for model_name, rm in list(self._processes.items()):
+                if now - rm.last_used_at > rm.idle_timeout:
+                    print(f"[ProcessManager] Unloading idle model: {model_name}")
+                    await self.unload(model_name)
+
+    async def _read_stdout(self, model_name: str):
+        """Read and log stdout for a model."""
+        rm = self._processes.get(model_name)
+        if not rm or not rm.process.stdout:
             return
         try:
-            async for line in self._process.stdout:
-                print(f"[llama-server stdout] {line.decode().strip()}")
+            async for line in rm.process.stdout:
+                print(f"[{model_name} stdout] {line.decode().strip()}")
         except asyncio.CancelledError:
             pass
 
-    async def _read_stderr(self) -> None:
-        """Read and log stderr."""
-        if not self._process or not self._process.stderr:
+    async def _read_stderr(self, model_name: str):
+        """Read and log stderr for a model."""
+        rm = self._processes.get(model_name)
+        if not rm or not rm.process.stderr:
             return
         try:
-            async for line in self._process.stderr:
-                print(f"[llama-server stderr] {line.decode().strip()}")
+            async for line in rm.process.stderr:
+                print(f"[{model_name} stderr] {line.decode().strip()}")
         except asyncio.CancelledError:
             pass
+
+    def _save_routing(self):
+        """Persist routing state to file."""
+        config = get_config()
+        data = {}
+        for name, rm in self._processes.items():
+            data[name] = {
+                "port": rm.port,
+                "pid": rm.process.pid,
+                "model": rm.model,
+                "started_at": rm.started_at,
+                "last_used_at": rm.last_used_at,
+                "idle_timeout": rm.idle_timeout,
+            }
+        try:
+            with open(config.routing_file, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"[ProcessManager] Failed to save routing: {e}")
+
+    def load_routing(self):
+        """Load routing state from file. Called on startup."""
+        config = get_config()
+        if not config.routing_file.exists():
+            return
+        try:
+            with open(config.routing_file) as f:
+                data = json.load(f)
+            # Note: We can't restore actual processes, just clear stale data
+            # The models will need to be reloaded
+            if data:
+                print(f"[ProcessManager] Found stale routing data for {list(data.keys())}, clearing")
+                self._save_routing()  # Clear it
+        except Exception as e:
+            print(f"[ProcessManager] Failed to load routing: {e}")
 
 
 # Global process manager
