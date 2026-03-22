@@ -10,17 +10,38 @@ from fastapi.responses import FileResponse, StreamingResponse
 from .config import init_config
 from .routes import models, server
 from .process_manager import get_process_manager
+from .anthropic_adapter import (
+    convert_anthropic_to_openai,
+    convert_openai_to_anthropic,
+    convert_stream_openai_to_anthropic,
+    create_error_response,
+)
+
+# Global HTTP client for streaming
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """Get or create the global HTTP client."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0))
+    return _http_client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    global _http_client
     # Startup
     init_config()
     yield
-    # Shutdown - stop all llama-servers
+    # Shutdown - stop all llama-servers and close HTTP client
     pm = get_process_manager()
     await pm.unload_all()
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
 
 
 app = FastAPI(
@@ -47,6 +68,121 @@ async def index():
     if index_path.exists():
         return FileResponse(index_path)
     return {"message": "llama-api is running", "docs": "/docs"}
+
+
+# Anthropic Messages API compatibility endpoint
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """Anthropic Messages API compatibility endpoint.
+
+    Converts Anthropic format to OpenAI format, forwards to llama-server,
+    and converts the response back to Anthropic format.
+    """
+    import json
+
+    pm = get_process_manager()
+
+    # Parse Anthropic request
+    try:
+        anthropic_body = await request.json()
+    except json.JSONDecodeError:
+        return Response(
+            content=json.dumps(create_error_response("invalid_request_error", "Invalid JSON body")),
+            status_code=400,
+            media_type="application/json"
+        )
+
+    # Get model
+    model_name = anthropic_body.get("model")
+    if not model_name:
+        return Response(
+            content=json.dumps(create_error_response("invalid_request_error", "Missing required field: model")),
+            status_code=400,
+            media_type="application/json"
+        )
+
+    rm = pm.get_model(model_name)
+    if not rm or rm.process.returncode is not None:
+        return Response(
+            content=json.dumps(create_error_response("not_found_error", f"Model '{model_name}' not loaded. Load via /api/server/load")),
+            status_code=503,
+            media_type="application/json"
+        )
+
+    # Update last used time
+    pm.touch_model(model_name)
+
+    # Convert to OpenAI format
+    openai_request = convert_anthropic_to_openai(anthropic_body)
+
+    # Build target URL
+    target_url = f"http://127.0.0.1:{rm.port}/v1/chat/completions"
+
+    # Prepare headers (exclude host and content-length, we'll set new body)
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    headers.pop("content-length", None)
+    headers["content-type"] = "application/json"
+
+    # Determine streaming
+    is_streaming = anthropic_body.get("stream", False)
+
+    if is_streaming:
+        client_timeout = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+    else:
+        client_timeout = httpx.Timeout(connect=30.0, read=3600.0, write=30.0, pool=30.0)
+
+    client = get_http_client()
+    try:
+        proxy_request = client.build_request(
+            method="POST",
+            url=target_url,
+            content=json.dumps(openai_request),
+            headers=headers,
+        )
+
+        response = await client.send(proxy_request, stream=True)
+
+        if is_streaming:
+            async def stream_generator():
+                async for chunk in convert_stream_openai_to_anthropic(
+                    response.aiter_bytes(),
+                    model_name,
+                    anthropic_body.get("max_tokens", 4096)
+                ):
+                    yield chunk
+                await response.aclose()
+
+            return StreamingResponse(
+                stream_generator(),
+                status_code=200,
+                media_type="text/event-stream"
+            )
+        else:
+            content = await response.aread()
+            await response.aclose()
+
+            try:
+                openai_response = json.loads(content)
+                anthropic_response = convert_openai_to_anthropic(openai_response, model_name)
+                return Response(
+                    content=json.dumps(anthropic_response),
+                    status_code=response.status_code,
+                    media_type="application/json"
+                )
+            except json.JSONDecodeError:
+                return Response(
+                    content=content,
+                    status_code=response.status_code,
+                    media_type="application/json"
+                )
+
+    except httpx.ConnectError:
+        return Response(
+            content=json.dumps(create_error_response("api_error", f"Cannot connect to llama-server for model '{model_name}'")),
+            status_code=503,
+            media_type="application/json"
+        )
 
 
 # Reverse proxy for /v1/* to llama-server
@@ -92,9 +228,13 @@ async def proxy_v1(request: Request, path: str):
     if request.url.query:
         target_url += f"?{request.url.query}"
 
-    # Prepare headers (exclude host)
+    # Prepare headers (exclude problematic headers)
     headers = dict(request.headers)
     headers.pop("host", None)
+    headers.pop("content-length", None)
+    headers.pop("transfer-encoding", None)
+    headers.pop("connection", None)
+    headers.pop("accept-encoding", None)
 
     # Determine if streaming
     accept = request.headers.get("accept", "")
@@ -108,40 +248,40 @@ async def proxy_v1(request: Request, path: str):
     else:
         client_timeout = httpx.Timeout(connect=30.0, read=3600.0, write=30.0, pool=30.0)
 
-    async with httpx.AsyncClient(timeout=client_timeout) as client:
-        try:
-            proxy_request = client.build_request(
-                method=request.method,
-                url=target_url,
-                content=body,
-                headers=headers,
-            )
+    client = get_http_client()
+    try:
+        proxy_request = client.build_request(
+            method=request.method,
+            url=target_url,
+            content=body,
+            headers=headers,
+        )
 
-            response = await client.send(proxy_request, stream=True)
+        response = await client.send(proxy_request, stream=True)
 
-            if is_streaming:
-                async def stream_generator():
-                    async for chunk in response.aiter_bytes():
-                        yield chunk
-                    await response.aclose()
-
-                return StreamingResponse(
-                    stream_generator(),
-                    status_code=response.status_code,
-                    headers=dict(response.headers),
-                    media_type="text/event-stream"
-                )
-            else:
-                content = await response.aread()
+        if is_streaming:
+            async def stream_generator():
+                async for chunk in response.aiter_bytes():
+                    yield chunk
                 await response.aclose()
-                return Response(
-                    content=content,
-                    status_code=response.status_code,
-                    headers=dict(response.headers),
-                )
-        except httpx.ConnectError:
-            return Response(
-                content=f'{{"error": "Cannot connect to llama-server for model \'{model_name}\'"}}',
-                status_code=503,
-                media_type="application/json"
+
+            return StreamingResponse(
+                stream_generator(),
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type="text/event-stream"
             )
+        else:
+            content = await response.aread()
+            await response.aclose()
+            return Response(
+                content=content,
+                status_code=response.status_code,
+                headers=dict(response.headers),
+            )
+    except httpx.ConnectError:
+        return Response(
+            content=f'{{"error": "Cannot connect to llama-server for model \'{model_name}\'"}}',
+            status_code=503,
+            media_type="application/json"
+        )
