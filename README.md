@@ -98,6 +98,12 @@ systemctl --user start llama-api
 | `/v1/completions` | POST | 文本补全 |
 | `/v1/embeddings` | POST | 向量嵌入 |
 
+### Anthropic 兼容 API
+
+| 端点 | 方法 | 功能 |
+|------|------|------|
+| `/v1/messages` | POST | 对话补全（Anthropic 格式） |
+
 ### 示例
 
 **加载模型：**
@@ -157,6 +163,19 @@ for chunk in response:
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
+
+**Anthropic 格式：**
+```bash
+curl http://localhost:8002/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen",
+    "max_tokens": 100,
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+```
+
+返回格式与 Anthropic API 兼容，支持 `thinking` 块、工具调用和流式响应。
 
 ## 配置说明
 
