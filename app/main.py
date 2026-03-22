@@ -18,10 +18,9 @@ async def lifespan(app: FastAPI):
     # Startup
     init_config()
     yield
-    # Shutdown - stop llama-server if running
+    # Shutdown - stop all llama-servers
     pm = get_process_manager()
-    if pm._process and pm._process.returncode is None:
-        await pm.stop()
+    await pm.unload_all()
 
 
 app = FastAPI(
@@ -53,34 +52,64 @@ async def index():
 # Reverse proxy for /v1/* to llama-server
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def proxy_v1(request: Request, path: str):
-    """Proxy /v1/* requests to llama-server."""
+    """Proxy /v1/* requests to appropriate llama-server based on model."""
+    import json
+
     pm = get_process_manager()
 
-    if not pm._port or pm._process is None or pm._process.returncode is not None:
+    # Get request body to extract model
+    body = await request.body()
+    model_name = None
+    body_json = None
+
+    if body:
+        try:
+            body_json = json.loads(body)
+            model_name = body_json.get("model")
+        except Exception:
+            pass
+
+    if not model_name:
         return Response(
-            content='{"error": "No model loaded. Load a model first via /api/server/load"}',
+            content='{"error": "No model specified in request body"}',
+            status_code=400,
+            media_type="application/json"
+        )
+
+    rm = pm.get_model(model_name)
+    if not rm or rm.process.returncode is not None:
+        return Response(
+            content=f'{{"error": "Model \'{model_name}\' not loaded. Load via /api/server/load"}}',
             status_code=503,
             media_type="application/json"
         )
 
+    # Update last used time
+    pm.touch_model(model_name)
+
     # Build target URL
-    target_url = f"http://127.0.0.1:{pm._port}/v1/{path}"
+    target_url = f"http://127.0.0.1:{rm.port}/v1/{path}"
     if request.url.query:
         target_url += f"?{request.url.query}"
-
-    # Get request body
-    body = await request.body()
 
     # Prepare headers (exclude host)
     headers = dict(request.headers)
     headers.pop("host", None)
 
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        try:
-            # Check if streaming is requested
-            accept = request.headers.get("accept", "")
-            is_streaming = "text/event-stream" in accept
+    # Determine if streaming
+    accept = request.headers.get("accept", "")
+    is_streaming = "text/event-stream" in accept
+    if not is_streaming and body_json:
+        if body_json.get("stream") is True:
+            is_streaming = True
 
+    if is_streaming:
+        client_timeout = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+    else:
+        client_timeout = httpx.Timeout(connect=30.0, read=3600.0, write=30.0, pool=30.0)
+
+    async with httpx.AsyncClient(timeout=client_timeout) as client:
+        try:
             proxy_request = client.build_request(
                 method=request.method,
                 url=target_url,
@@ -88,7 +117,7 @@ async def proxy_v1(request: Request, path: str):
                 headers=headers,
             )
 
-            response = await client.send(proxy_request, stream=is_streaming)
+            response = await client.send(proxy_request, stream=True)
 
             if is_streaming:
                 async def stream_generator():
@@ -104,6 +133,7 @@ async def proxy_v1(request: Request, path: str):
                 )
             else:
                 content = await response.aread()
+                await response.aclose()
                 return Response(
                     content=content,
                     status_code=response.status_code,
@@ -111,7 +141,7 @@ async def proxy_v1(request: Request, path: str):
                 )
         except httpx.ConnectError:
             return Response(
-                content='{"error": "Cannot connect to llama-server"}',
+                content=f'{{"error": "Cannot connect to llama-server for model \'{model_name}\'"}}',
                 status_code=503,
                 media_type="application/json"
             )
