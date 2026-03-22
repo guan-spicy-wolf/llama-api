@@ -1,10 +1,10 @@
 """Server control API routes."""
-import os
+import time
 
 import psutil
 from fastapi import APIRouter, HTTPException
 
-from ..models import LoadRequest, LoadResponse
+from ..models import LoadRequest, LoadResponse, UnloadRequest
 from ..process_manager import get_process_manager
 from ..config import get_config
 
@@ -13,37 +13,76 @@ router = APIRouter(prefix="/api/server", tags=["server"])
 
 @router.get("/status")
 async def get_status() -> dict:
-    """Get current server status."""
+    """Get status of all loaded models."""
     pm = get_process_manager()
-    return pm.status.model_dump()
+
+    models = {}
+    for name, rm in pm.processes.items():
+        # Check if process is still alive
+        if rm.process.returncode is not None:
+            continue
+
+        idle_remaining = rm.idle_timeout - (time.time() - rm.last_used_at)
+        models[name] = {
+            "port": rm.port,
+            "pid": rm.process.pid,
+            "model": rm.model,
+            "started_at": rm.started_at,
+            "last_used_at": rm.last_used_at,
+            "idle_timeout": rm.idle_timeout,
+            "idle_remaining": max(0, idle_remaining),
+        }
+
+    # Get total process memory
+    total_mem = 0.0
+    for name, rm in pm.processes.items():
+        try:
+            proc = psutil.Process(rm.process.pid)
+            total_mem += proc.memory_info().rss / (1024 ** 3)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    return {
+        "models": models,
+        "total_memory_gb": round(total_mem, 1),
+    }
+
+
+@router.get("/status/{model_name}")
+async def get_model_status(model_name: str) -> dict:
+    """Get status of a specific model."""
+    pm = get_process_manager()
+    rm = pm.get_model(model_name)
+
+    if not rm or rm.process.returncode is not None:
+        return {"status": "not_loaded", "model": model_name}
+
+    idle_remaining = rm.idle_timeout - (time.time() - rm.last_used_at)
+    return {
+        "status": "running",
+        "port": rm.port,
+        "pid": rm.process.pid,
+        "model": rm.model,
+        "started_at": rm.started_at,
+        "last_used_at": rm.last_used_at,
+        "idle_timeout": rm.idle_timeout,
+        "idle_remaining": max(0, idle_remaining),
+    }
 
 
 @router.get("/metrics")
 async def get_metrics() -> dict:
     """Get system metrics (CPU, memory, GPU)."""
-    # CPU
     cpu_percent = psutil.cpu_percent(interval=0.5)
 
-    # Memory
     mem = psutil.virtual_memory()
     mem_total_gb = round(mem.total / (1024 ** 3), 1)
     mem_used_gb = round(mem.used / (1024 ** 3), 1)
     mem_percent = mem.percent
 
-    # Process memory (llama-server)
-    pm = get_process_manager()
-    process_mem_gb = 0.0
-    if pm._process and pm._process.pid:
-        try:
-            proc = psutil.Process(pm._process.pid)
-            process_mem_gb = round(proc.memory_info().rss / (1024 ** 3), 1)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-
-    # GPU memory (ROCm)
-    gpu_mem_percent = None
-    gpu_mem_used_gb = None
-    gpu_mem_total_gb = 96.0  # Default for Radeon 8060S
+    # GPU utilization (ROCm)
+    gpu_util_percent = None
+    gpu_temp = None
     try:
         import subprocess
         result = subprocess.run(
@@ -53,34 +92,30 @@ async def get_metrics() -> dict:
         if result.returncode == 0:
             lines = result.stdout.strip().split("\n")
             for line in lines:
-                # Look for data line starting with device index
                 if line.strip() and line[0].isdigit() and "Device" not in line:
                     parts = line.split()
-                    # VRAM% is at index 14, GPU% at index 15
-                    if len(parts) >= 15:
-                        vram_str = parts[14].rstrip('%')
-                        if vram_str.replace('.', '').isdigit():
-                            gpu_mem_percent = float(vram_str)
-                            gpu_mem_used_gb = round(gpu_mem_total_gb * gpu_mem_percent / 100, 1)
+                    if len(parts) >= 16:
+                        gpu_str = parts[15].rstrip('%')
+                        if gpu_str.replace('.', '').isdigit():
+                            gpu_util_percent = float(gpu_str)
+                        temp_str = parts[4].rstrip('°C')
+                        if temp_str.replace('.', '').isdigit():
+                            gpu_temp = float(temp_str)
                         break
     except Exception:
         pass
 
     return {
-        "cpu": {
-            "percent": cpu_percent,
-        },
+        "cpu": {"percent": cpu_percent},
         "memory": {
             "total_gb": mem_total_gb,
             "used_gb": mem_used_gb,
             "percent": mem_percent,
-            "process_gb": process_mem_gb,
         },
         "gpu": {
-            "total_gb": gpu_mem_total_gb,
-            "used_gb": gpu_mem_used_gb,
-            "percent": gpu_mem_percent,
-        } if gpu_mem_percent is not None else None,
+            "util_percent": gpu_util_percent,
+            "temp": gpu_temp,
+        } if gpu_util_percent is not None else None,
     }
 
 
@@ -90,7 +125,6 @@ async def load_model(request: LoadRequest) -> LoadResponse:
     pm = get_process_manager()
     config = get_config()
 
-    # Check model exists
     if not config.get_model_config(request.model):
         raise HTTPException(status_code=404, detail=f"Model '{request.model}' not found")
 
@@ -100,14 +134,27 @@ async def load_model(request: LoadRequest) -> LoadResponse:
             success=True,
             message=f"Model '{request.model}' loaded successfully",
             pid=info.pid,
+            port=info.port,
         )
+    except MemoryError as e:
+        raise HTTPException(status_code=507, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/unload")
-async def unload_model() -> dict:
-    """Unload current model and stop llama-server."""
+async def unload_model(request: UnloadRequest) -> dict:
+    """Unload a specific model."""
     pm = get_process_manager()
-    await pm.stop()
-    return {"message": "Model unloaded", "status": "stopped"}
+    success = await pm.unload(request.model)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Model '{request.model}' not loaded")
+    return {"message": f"Model '{request.model}' unloaded", "model": request.model}
+
+
+@router.post("/unload/all")
+async def unload_all_models() -> dict:
+    """Unload all models."""
+    pm = get_process_manager()
+    await pm.unload_all()
+    return {"message": "All models unloaded"}
