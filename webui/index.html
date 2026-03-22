@@ -13,7 +13,7 @@
             min-height: 100vh;
             padding: 2rem;
         }
-        .container { max-width: 800px; margin: 0 auto; }
+        .container { max-width: 900px; margin: 0 auto; }
         h1 { margin-bottom: 1rem; color: #4ecca3; }
         h2 { margin: 1.5rem 0 1rem; color: #4ecca3; font-size: 1.2rem; }
         .card {
@@ -43,6 +43,7 @@
             border-radius: 6px;
         }
         .model-item:hover { background: #0f3460; }
+        .model-item.loaded { border-left: 3px solid #4ecca3; }
         button {
             padding: 0.5rem 1rem;
             border: none;
@@ -63,41 +64,46 @@
         .info { color: #9ca3af; font-size: 0.875rem; margin-top: 0.5rem; }
         .error { color: #f87171; margin-top: 0.5rem; }
         .refresh-btn { float: right; }
-        .model-id-box {
-            background: #0f3460;
-            padding: 0.75rem 1rem;
-            border-radius: 6px;
-            margin-top: 0.75rem;
+
+        /* Loaded models grid */
+        .loaded-models {
+            display: grid;
+            gap: 1rem;
+        }
+        .loaded-model-card {
+            background: #1a1a2e;
+            border-radius: 8px;
+            padding: 1rem;
+            border-left: 4px solid #4ecca3;
+        }
+        .loaded-model-header {
             display: flex;
+            justify-content: space-between;
             align-items: center;
-            gap: 0.75rem;
-            font-family: monospace;
+            margin-bottom: 0.5rem;
         }
-        .model-id-box code { flex: 1; color: #4ecca3; }
-        .api-example {
-            background: #0f0f1a;
-            padding: 0.75rem 1rem;
-            border-radius: 6px;
+        .loaded-model-name {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #4ecca3;
+        }
+        .loaded-model-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 0.5rem;
             margin-top: 0.75rem;
-            font-family: monospace;
-            font-size: 0.8rem;
+            font-size: 0.85rem;
+        }
+        .loaded-model-info span {
             color: #9ca3af;
-            white-space: pre-wrap;
-            word-break: break-all;
         }
-        .copied-toast {
-            position: fixed;
-            bottom: 2rem;
-            left: 50%;
-            transform: translateX(-50%);
-            background: #059669;
-            color: white;
-            padding: 0.5rem 1rem;
-            border-radius: 6px;
-            opacity: 0;
-            transition: opacity 0.3s;
+        .idle-countdown {
+            color: #d97706;
+            font-weight: 500;
         }
-        .copied-toast.show { opacity: 1; }
+        .idle-countdown.warning {
+            color: #dc2626;
+        }
 
         /* Metrics styles */
         .metrics-grid {
@@ -146,6 +152,31 @@
             color: #6b7280;
             margin-top: 0.25rem;
         }
+
+        .api-example {
+            background: #0f0f1a;
+            padding: 0.75rem 1rem;
+            border-radius: 6px;
+            margin-top: 0.75rem;
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: #9ca3af;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .copied-toast {
+            position: fixed;
+            bottom: 2rem;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #059669;
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .copied-toast.show { opacity: 1; }
     </style>
 </head>
 <body>
@@ -161,30 +192,28 @@
                     <div class="metric-bar"><div class="metric-bar-fill" id="cpu-bar" style="width: 0%"></div></div>
                 </div>
                 <div class="metric-item">
-                    <div class="metric-label">Memory</div>
+                    <div class="metric-label">统一内存</div>
                     <div class="metric-value" id="mem-value">--</div>
                     <div class="metric-bar"><div class="metric-bar-fill" id="mem-bar" style="width: 0%"></div></div>
                     <div class="metric-detail" id="mem-detail">-- / -- GB</div>
                 </div>
                 <div class="metric-item">
-                    <div class="metric-label">GPU VRAM</div>
+                    <div class="metric-label">GPU</div>
                     <div class="metric-value" id="gpu-value">--</div>
                     <div class="metric-bar"><div class="metric-bar-fill" id="gpu-bar" style="width: 0%"></div></div>
-                    <div class="metric-detail" id="gpu-detail">-- / -- GB</div>
+                    <div class="metric-detail" id="gpu-detail">--</div>
                 </div>
             </div>
         </div>
 
         <div class="card">
-            <h2>Server Status</h2>
-            <div id="status-content">
-                <span class="status-badge status-stopped">Loading...</span>
+            <h2>Loaded Models
+                <button class="btn btn-secondary refresh-btn" onclick="loadStatus()">Refresh</button>
+            </h2>
+            <div id="loaded-models" class="loaded-models">
+                <div class="info">Loading...</div>
             </div>
-            <div id="status-info" class="info"></div>
-            <div id="model-id-section"></div>
-            <div style="margin-top: 1rem;">
-                <button id="unload-btn" class="btn btn-danger" onclick="unloadModel()" disabled>Unload Model</button>
-            </div>
+            <div id="total-memory" class="info" style="margin-top: 0.75rem;"></div>
         </div>
 
         <div class="card">
@@ -201,11 +230,18 @@
 
     <script>
         let currentStatus = null;
+        let loadedModels = {};
 
         function getBarClass(percent) {
             if (percent < 60) return 'metric-bar-low';
             if (percent < 85) return 'metric-bar-mid';
             return 'metric-bar-high';
+        }
+
+        function formatSeconds(seconds) {
+            if (seconds < 60) return `${Math.round(seconds)}s`;
+            if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+            return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
         }
 
         async function loadMetrics() {
@@ -223,19 +259,16 @@
                 // Memory
                 const memPercent = data.memory.percent;
                 document.getElementById('mem-value').textContent = memPercent.toFixed(1) + '%';
-                document.getElementById('mem-detail').textContent =
-                    `${data.memory.used_gb} / ${data.memory.total_gb} GB` +
-                    (data.memory.process_gb > 0 ? ` (model: ${data.memory.process_gb} GB)` : '');
+                document.getElementById('mem-detail').textContent = `${data.memory.used_gb} / ${data.memory.total_gb} GB`;
                 const memBar = document.getElementById('mem-bar');
                 memBar.style.width = memPercent + '%';
                 memBar.className = 'metric-bar-fill ' + getBarClass(memPercent);
 
                 // GPU
                 if (data.gpu) {
-                    const gpuPercent = data.gpu.percent;
+                    const gpuPercent = data.gpu.util_percent;
                     document.getElementById('gpu-value').textContent = gpuPercent.toFixed(1) + '%';
-                    document.getElementById('gpu-detail').textContent =
-                        `${data.gpu.used_gb} / ${data.gpu.total_gb} GB`;
+                    document.getElementById('gpu-detail').textContent = data.gpu.temp ? `温度: ${data.gpu.temp}°C` : '';
                     const gpuBar = document.getElementById('gpu-bar');
                     gpuBar.style.width = gpuPercent + '%';
                     gpuBar.className = 'metric-bar-fill ' + getBarClass(gpuPercent);
@@ -263,70 +296,67 @@
             try {
                 const resp = await fetch('/api/server/status');
                 currentStatus = await resp.json();
+                loadedModels = currentStatus.models || {};
                 updateStatusUI();
             } catch (e) {
-                document.getElementById('status-content').innerHTML =
-                    '<span class="status-badge status-error">Error</span>';
-                document.getElementById('status-info').textContent = e.message;
+                document.getElementById('loaded-models').innerHTML =
+                    `<div class="error">Error: ${e.message}</div>`;
             }
         }
 
         function updateStatusUI() {
-            const status = currentStatus;
-            const statusEl = document.getElementById('status-content');
-            const infoEl = document.getElementById('status-info');
-            const modelIdSection = document.getElementById('model-id-section');
-            const unloadBtn = document.getElementById('unload-btn');
+            const container = document.getElementById('loaded-models');
+            const totalMemoryEl = document.getElementById('total-memory');
+            const modelCount = Object.keys(loadedModels).length;
 
-            let badgeClass = 'status-stopped';
-            if (status.status === 'running') badgeClass = 'status-running';
-            else if (status.status === 'error') badgeClass = 'status-error';
+            if (modelCount === 0) {
+                container.innerHTML = '<div class="info">No models loaded. Click "Load" on a model below.</div>';
+                totalMemoryEl.textContent = '';
+                return;
+            }
 
-            statusEl.innerHTML = `<span class="status-badge ${badgeClass}">${status.status}</span>`;
+            const baseUrl = window.location.origin;
+            let html = '';
 
-            if (status.status === 'running') {
-                infoEl.textContent = `PID: ${status.pid}`;
-                unloadBtn.disabled = false;
+            for (const [name, info] of Object.entries(loadedModels)) {
+                const idleRemaining = info.idle_remaining || 0;
+                const idleClass = idleRemaining < 60 ? 'idle-countdown warning' : 'idle-countdown';
 
-                const baseUrl = window.location.origin;
-                modelIdSection.innerHTML = `
-                    <div class="model-id-box">
-                        <span style="color: #9ca3af;">Model ID:</span>
-                        <code>${status.model}</code>
-                        <button class="btn btn-copy" onclick="copyToClipboard('${status.model}')">Copy</button>
-                    </div>
-                    <div class="api-example">
-<span style="color: #4ecca3;"># API Endpoint:</span>
-${baseUrl}/v1/chat/completions
-
-<span style="color: #4ecca3;"># Example:</span>
+                html += `
+                    <div class="loaded-model-card">
+                        <div class="loaded-model-header">
+                            <span class="loaded-model-name">${name}</span>
+                            <button class="btn btn-danger" onclick="unloadModel('${name}')">Unload</button>
+                        </div>
+                        <div class="loaded-model-info">
+                            <div><span>PID:</span> ${info.pid}</div>
+                            <div><span>Port:</span> ${info.port}</div>
+                            <div><span>Idle:</span> <span class="${idleClass}">${formatSeconds(idleRemaining)}</span></div>
+                        </div>
+                        <div class="api-example" style="margin-top: 0.5rem;">
+<span style="color: #4ecca3;"># Example request:</span>
 curl ${baseUrl}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -d '{"model": "${status.model}", "messages": [{"role": "user", "content": "Hello"}]}'
-
-<span style="color: #4ecca3;"># Python:</span>
-from openai import OpenAI
-client = OpenAI(base_url="${baseUrl}/v1", api_key="none")
-response = client.chat.completions.create(
-    model="${status.model}",
-    messages=[{"role": "user", "content": "Hello"}]
-)</div>
+  -d '{"model": "${name}", "messages": [{"role": "user", "content": "Hello"}]}'
+                        </div>
+                    </div>
                 `;
-            } else if (status.error) {
-                infoEl.textContent = status.error;
-                modelIdSection.innerHTML = '';
-                unloadBtn.disabled = true;
-            } else {
-                infoEl.textContent = 'No model loaded';
-                modelIdSection.innerHTML = '';
-                unloadBtn.disabled = true;
             }
+
+            container.innerHTML = html;
+            totalMemoryEl.textContent = `Total model memory: ${currentStatus.total_memory_gb} GB`;
         }
 
         async function loadModels() {
             try {
-                const resp = await fetch('/api/models');
-                const models = await resp.json();
+                const [modelsResp, statusResp] = await Promise.all([
+                    fetch('/api/models'),
+                    fetch('/api/server/status')
+                ]);
+                const models = await modelsResp.json();
+                const status = await statusResp.json();
+                const loadedNames = new Set(Object.keys(status.models || {}));
+
                 const listEl = document.getElementById('model-list');
 
                 if (models.length === 0) {
@@ -334,15 +364,21 @@ response = client.chat.completions.create(
                     return;
                 }
 
-                listEl.innerHTML = models.map(m => `
-                    <li class="model-item">
-                        <div>
-                            <strong>${m.name}</strong>
-                            <div class="info">${m.file}</div>
-                        </div>
-                        <button class="btn btn-primary" onclick="loadModel('${m.name}')">Load</button>
-                    </li>
-                `).join('');
+                listEl.innerHTML = models.map(m => {
+                    const isLoaded = loadedNames.has(m.name);
+                    return `
+                        <li class="model-item ${isLoaded ? 'loaded' : ''}">
+                            <div>
+                                <strong>${m.name}</strong>
+                                <div class="info">${m.file}${m.idle_timeout ? ` (timeout: ${m.idle_timeout}s)` : ''}</div>
+                            </div>
+                            ${isLoaded
+                                ? `<span class="status-badge status-running">Running</span>`
+                                : `<button class="btn btn-primary" onclick="loadModel('${m.name}')">Load</button>`
+                            }
+                        </li>
+                    `;
+                }).join('');
             } catch (e) {
                 document.getElementById('model-list').innerHTML =
                     `<li class="error">Failed to load models: ${e.message}</li>`;
@@ -362,17 +398,28 @@ response = client.chat.completions.create(
                     throw new Error(err.detail || 'Failed to load model');
                 }
 
-                await loadStatus();
+                showToast(`Model '${name}' loaded`);
+                await Promise.all([loadStatus(), loadModels()]);
             } catch (e) {
                 alert(`Error: ${e.message}`);
             }
         }
 
-        async function unloadModel() {
+        async function unloadModel(name) {
             try {
-                const resp = await fetch('/api/server/unload', { method: 'POST' });
-                if (!resp.ok) throw new Error('Failed to unload');
-                await loadStatus();
+                const resp = await fetch('/api/server/unload', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model: name })
+                });
+
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    throw new Error(err.detail || 'Failed to unload model');
+                }
+
+                showToast(`Model '${name}' unloaded`);
+                await Promise.all([loadStatus(), loadModels()]);
             } catch (e) {
                 alert(`Error: ${e.message}`);
             }
