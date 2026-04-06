@@ -125,6 +125,9 @@ async def load_model(request: LoadRequest) -> LoadResponse:
     pm = get_process_manager()
     config = get_config()
 
+    # Re-read yaml from disk so edits take effect without a service restart.
+    config.reload_model_config(request.model)
+
     if not config.get_model_config(request.model):
         raise HTTPException(status_code=404, detail=f"Model '{request.model}' not found")
 
@@ -150,6 +153,16 @@ async def unload_model(request: UnloadRequest) -> dict:
     if not success:
         raise HTTPException(status_code=404, detail=f"Model '{request.model}' not loaded")
     return {"message": f"Model '{request.model}' unloaded", "model": request.model}
+
+
+@router.post("/reload")
+async def reload_configs() -> dict:
+    """Re-read all model yaml files from models.d/ without restarting the
+    service. Does not affect already-running model processes; new edits take
+    effect on the next /load call."""
+    config = get_config()
+    count = config.reload_all_model_configs()
+    return {"message": f"Reloaded {count} model configs", "count": count}
 
 
 @router.post("/unload/all")

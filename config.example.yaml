@@ -1,14 +1,28 @@
 # llama-api 配置文件示例
 # 复制到 /var/containers/llama-api/config.yaml
 
-# llama-server 可执行文件路径
-llama_server: /home/holo/llama.cpp/rocm/bin/llama-server
+# --- Podman 容器模式（推荐）---
 
-# 动态库路径（llama.cpp 的 lib 目录）
-ld_library_path: /home/holo/llama.cpp/rocm/bin
+# 容器镜像，包含 tag（后续升级只需修改此处）
+container_image: localhost/llama-cpp-rocm:b8665
 
-# 模型文件目录
+# 容器内 llama-server 可执行文件路径（默认 llama-server，在 PATH 中）
+# container_llama_bin: /usr/local/bin/llama-server
+
+# 额外 podman 参数（可选，用于覆盖设备或挂载等）
+# podman_extra_args:
+#   - --device=/dev/dri/renderD129
+#   - --env=HSA_OVERRIDE_GFX_VERSION=10.3.0
+
+# --- 直接进程模式（如不使用容器，取消注释）---
+
+# llama_server: /home/holo/llama.cpp/rocm/bin/llama-server
+# ld_library_path: /home/holo/llama.cpp/rocm/bin
+
+# --- 通用配置 ---
+
+# 模型文件目录（容器模式下会以只读方式挂载到容器内相同路径）
 models_dir: /var/models
 
-# 默认端口
-default_port: 8080
+# 模型空闲超时（秒），超时后自动卸载
+default_idle_timeout: 300

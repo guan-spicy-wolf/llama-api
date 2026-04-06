@@ -1,4 +1,4 @@
-"""Process manager for llama-server."""
+"""Process manager for llama-server (via podman or direct process)."""
 import asyncio
 import json
 import os
@@ -33,14 +33,12 @@ def get_available_memory_gb() -> float:
                     return int(line.split()[1]) / (1024 * 1024)
     except Exception:
         pass
-    # Fallback
     import psutil
     return psutil.virtual_memory().available / (1024 ** 3)
 
 
 def estimate_model_memory_gb(model_path: Path) -> float:
     """Estimate model memory requirement from file size."""
-    # GGUF file size is roughly the memory needed
     return model_path.stat().st_size / (1024 ** 3)
 
 
@@ -48,26 +46,16 @@ def estimate_model_memory_gb(model_path: Path) -> float:
 class RunningModel:
     """Runtime state for a loaded model."""
     process: asyncio.subprocess.Process
+    container_name: str  # podman container name or 'proc-{model}' for direct mode
     port: int
     model: str
     started_at: float
     last_used_at: float
     idle_timeout: int
 
-    def to_persist(self) -> dict:
-        """Get persistable state (without process object)."""
-        return {
-            "port": self.port,
-            "pid": self.process.pid,
-            "model": self.model,
-            "started_at": self.started_at,
-            "last_used_at": self.last_used_at,
-            "idle_timeout": self.idle_timeout,
-        }
-
 
 class ProcessManager:
-    """Manages multiple llama-server processes."""
+    """Manages multiple llama-server instances (via podman containers or direct processes)."""
 
     def __init__(self):
         self._processes: Dict[str, RunningModel] = {}
@@ -77,21 +65,18 @@ class ProcessManager:
 
     @property
     def processes(self) -> Dict[str, RunningModel]:
-        """Get all running processes."""
         return self._processes
 
     def get_model(self, model_name: str) -> Optional[RunningModel]:
-        """Get a specific model's process info."""
         return self._processes.get(model_name)
 
     def touch_model(self, model_name: str) -> None:
-        """Update last_used_at for a model."""
         if model_name in self._processes:
             self._processes[model_name].last_used_at = time.time()
             self._save_routing()
 
     async def start(self, model_name: str) -> ProcessInfo:
-        """Start llama-server with specified model."""
+        """Start llama-server for the specified model."""
         config = get_config()
         model_config = config.get_model_config(model_name)
 
@@ -103,7 +88,6 @@ class ProcessManager:
             if proc.process.returncode is None:
                 raise RuntimeError(f"Model '{model_name}' is already running")
             else:
-                # Clean up dead process
                 del self._processes[model_name]
 
         model_path = config.models_dir / model_config.file
@@ -119,38 +103,43 @@ class ProcessManager:
                 f"need ~{required:.1f}GB, only {available:.1f}GB available"
             )
 
-        # Get idle timeout
         idle_timeout = model_config.idle_timeout or config.default_idle_timeout
 
-        # Find port
+        # Find a free port not already used by running models
         used_ports = {p.port for p in self._processes.values()}
         port = find_free_port()
         while port in used_ports:
             port = find_free_port(port + 1)
 
-        # Build command
+        # Build llama-server arguments (same for both modes)
         args = config.get_effective_args(model_name)
-        cmd = [
-            str(config.llama_server),
-            "-m", str(model_path),
-            "--alias", model_name,
-            "--port", str(port),
-            "--host", "0.0.0.0",
-        ]
-
         args_dict = args.model_dump(exclude_unset=True, exclude_none=True)
-        for key, value in args_dict.items():
-            arg_name = key.replace("_", "-")
-            cmd.extend([f"--{arg_name}", str(value)])
 
-        # Prepare environment
-        env = os.environ.copy()
-        if config.ld_library_path:
-            current_ld = env.get("LD_LIBRARY_PATH", "")
-            if current_ld:
-                env["LD_LIBRARY_PATH"] = f"{config.ld_library_path}:{current_ld}"
-            else:
-                env["LD_LIBRARY_PATH"] = config.ld_library_path
+        if config.container_image:
+            container_name = f"llama-{model_name}"
+            # Remove any stale container from a previous crash
+            stale = await asyncio.create_subprocess_exec(
+                "podman", "rm", "-f", container_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await stale.wait()
+
+            cmd, container_name = self._build_podman_cmd(
+                config, model_name, model_path, port, args_dict
+            )
+            env = None  # Container handles its own environment
+        else:
+            cmd, container_name = self._build_direct_cmd(
+                config, model_name, model_path, port, args_dict
+            )
+            env = os.environ.copy()
+            if config.ld_library_path:
+                current_ld = env.get("LD_LIBRARY_PATH", "")
+                env["LD_LIBRARY_PATH"] = (
+                    f"{config.ld_library_path}:{current_ld}" if current_ld
+                    else config.ld_library_path
+                )
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -160,14 +149,17 @@ class ProcessManager:
                 env=env,
             )
 
-            # Wait briefly to check immediate failure
+            # Wait briefly to catch immediate startup failures
             await asyncio.sleep(0.5)
             if process.returncode is not None:
-                raise RuntimeError(f"Process exited immediately with code {process.returncode}")
+                raise RuntimeError(
+                    f"Process exited immediately with code {process.returncode}"
+                )
 
             now = time.time()
             self._processes[model_name] = RunningModel(
                 process=process,
+                container_name=container_name,
                 port=port,
                 model=model_name,
                 started_at=now,
@@ -175,7 +167,6 @@ class ProcessManager:
                 idle_timeout=idle_timeout,
             )
 
-            # Start output readers
             self._stdout_tasks[model_name] = asyncio.create_task(
                 self._read_stdout(model_name)
             )
@@ -183,7 +174,6 @@ class ProcessManager:
                 self._read_stderr(model_name)
             )
 
-            # Start idle checker if not running
             if self._idle_task is None or self._idle_task.done():
                 self._idle_task = asyncio.create_task(self._idle_checker())
 
@@ -198,8 +188,73 @@ class ProcessManager:
                 idle_timeout=idle_timeout,
             )
 
-        except Exception as e:
+        except Exception:
             raise
+
+    def _build_podman_cmd(
+        self,
+        config,
+        model_name: str,
+        model_path: Path,
+        host_port: int,
+        args_dict: dict,
+    ) -> tuple[list[str], str]:
+        """Build podman run command. Returns (cmd, container_name)."""
+        container_name = f"llama-{model_name}"
+
+        cmd = [
+            "podman", "run",
+            "--rm",
+            "--name", container_name,
+            "-p", f"{host_port}:8080",
+            "-v", f"{config.models_dir}:{config.models_dir}:ro,z",
+            "--device", "/dev/dri",
+            "--device", "/dev/kfd",
+            "--group-add", "video",
+            "--security-opt", "seccomp=unconfined",
+            "--ipc=host",
+        ]
+
+        if config.podman_extra_args:
+            cmd.extend(config.podman_extra_args)
+
+        cmd.append(config.container_image)
+
+        # llama-server binary + args inside the container (port always 8080)
+        cmd.append(config.container_llama_bin)
+        cmd += [
+            "-m", str(model_path),
+            "--alias", model_name,
+            "--port", "8080",
+            "--host", "0.0.0.0",
+        ]
+        for key, value in args_dict.items():
+            cmd.extend([f"--{key.replace('_', '-')}", str(value)])
+
+        return cmd, container_name
+
+    def _build_direct_cmd(
+        self,
+        config,
+        model_name: str,
+        model_path: Path,
+        port: int,
+        args_dict: dict,
+    ) -> tuple[list[str], str]:
+        """Build direct llama-server command. Returns (cmd, container_name)."""
+        container_name = f"proc-{model_name}"
+
+        cmd = [
+            str(config.llama_server),
+            "-m", str(model_path),
+            "--alias", model_name,
+            "--port", str(port),
+            "--host", "0.0.0.0",
+        ]
+        for key, value in args_dict.items():
+            cmd.extend([f"--{key.replace('_', '-')}", str(value)])
+
+        return cmd, container_name
 
     async def unload(self, model_name: str) -> bool:
         """Unload a specific model."""
@@ -207,29 +262,54 @@ class ProcessManager:
             return False
 
         rm = self._processes[model_name]
+        config = get_config()
 
         try:
             if rm.process.returncode is None:
-                rm.process.terminate()
-                try:
-                    await asyncio.wait_for(rm.process.wait(), timeout=10)
-                except asyncio.TimeoutError:
-                    rm.process.kill()
-                    await rm.process.wait()
+                if config.container_image:
+                    await self._stop_container(rm.container_name, rm.process)
+                else:
+                    rm.process.terminate()
+                    try:
+                        await asyncio.wait_for(rm.process.wait(), timeout=10)
+                    except asyncio.TimeoutError:
+                        rm.process.kill()
+                        await rm.process.wait()
         except ProcessLookupError:
             pass
 
-        # Clean up
         del self._processes[model_name]
-        if model_name in self._stdout_tasks:
-            self._stdout_tasks[model_name].cancel()
-            del self._stdout_tasks[model_name]
-        if model_name in self._stderr_tasks:
-            self._stderr_tasks[model_name].cancel()
-            del self._stderr_tasks[model_name]
+        for task_dict in (self._stdout_tasks, self._stderr_tasks):
+            if model_name in task_dict:
+                task_dict[model_name].cancel()
+                del task_dict[model_name]
 
         self._save_routing()
         return True
+
+    async def _stop_container(
+        self, container_name: str, process: asyncio.subprocess.Process
+    ) -> None:
+        """Stop a podman container and wait for its run process to exit."""
+        stop_proc = await asyncio.create_subprocess_exec(
+            "podman", "stop", container_name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(stop_proc.wait(), process.wait()),
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            # Force kill the container, then wait
+            kill_proc = await asyncio.create_subprocess_exec(
+                "podman", "kill", container_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await kill_proc.wait()
+            await process.wait()
 
     async def unload_all(self) -> None:
         """Unload all models."""
@@ -237,9 +317,9 @@ class ProcessManager:
             await self.unload(model_name)
 
     async def _idle_checker(self):
-        """Background task to check for idle models."""
+        """Background task to unload idle models."""
         while True:
-            await asyncio.sleep(60)  # Check every minute
+            await asyncio.sleep(60)
             now = time.time()
             for model_name, rm in list(self._processes.items()):
                 if now - rm.last_used_at > rm.idle_timeout:
@@ -247,7 +327,6 @@ class ProcessManager:
                     await self.unload(model_name)
 
     async def _read_stdout(self, model_name: str):
-        """Read and log stdout for a model."""
         rm = self._processes.get(model_name)
         if not rm or not rm.process.stdout:
             return
@@ -258,7 +337,6 @@ class ProcessManager:
             pass
 
     async def _read_stderr(self, model_name: str):
-        """Read and log stderr for a model."""
         rm = self._processes.get(model_name)
         if not rm or not rm.process.stderr:
             return
@@ -276,6 +354,7 @@ class ProcessManager:
             data[name] = {
                 "port": rm.port,
                 "pid": rm.process.pid,
+                "container_name": rm.container_name,
                 "model": rm.model,
                 "started_at": rm.started_at,
                 "last_used_at": rm.last_used_at,
@@ -288,18 +367,19 @@ class ProcessManager:
             print(f"[ProcessManager] Failed to save routing: {e}")
 
     def load_routing(self):
-        """Load routing state from file. Called on startup."""
+        """Load routing state from file (startup only — clears stale data)."""
         config = get_config()
         if not config.routing_file.exists():
             return
         try:
             with open(config.routing_file) as f:
                 data = json.load(f)
-            # Note: We can't restore actual processes, just clear stale data
-            # The models will need to be reloaded
             if data:
-                print(f"[ProcessManager] Found stale routing data for {list(data.keys())}, clearing")
-                self._save_routing()  # Clear it
+                print(
+                    f"[ProcessManager] Found stale routing data for "
+                    f"{list(data.keys())}, clearing"
+                )
+                self._save_routing()
         except Exception as e:
             print(f"[ProcessManager] Failed to load routing: {e}")
 
@@ -309,7 +389,6 @@ _process_manager: Optional[ProcessManager] = None
 
 
 def get_process_manager() -> ProcessManager:
-    """Get global process manager instance."""
     global _process_manager
     if _process_manager is None:
         _process_manager = ProcessManager()

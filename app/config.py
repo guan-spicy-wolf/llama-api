@@ -21,6 +21,9 @@ class Config:
         self.llama_server = Path.home() / "llama.cpp/rocm/bin/llama-server"
         self.default_port = 8080
         self.ld_library_path: Optional[str] = None
+        self.container_image: Optional[str] = None
+        self.container_llama_bin: str = "llama-server"
+        self.podman_extra_args: list[str] = []
         self.default_idle_timeout: int = 300  # 5 minutes
         self.data_dir = self.config_dir
         self.routing_file = self.data_dir / "routing.json"
@@ -44,6 +47,12 @@ class Config:
                 self.ld_library_path = data["ld_library_path"]
             if "default_idle_timeout" in data:
                 self.default_idle_timeout = data["default_idle_timeout"]
+            if "container_image" in data:
+                self.container_image = data["container_image"]
+            if "container_llama_bin" in data:
+                self.container_llama_bin = data["container_llama_bin"]
+            if "podman_extra_args" in data:
+                self.podman_extra_args = list(data["podman_extra_args"])
 
     def _load_model_configs(self) -> None:
         """Load all model configuration files from models.d/."""
@@ -60,6 +69,32 @@ class Config:
                     self._model_configs[config.name] = config
             except Exception as e:
                 print(f"Warning: Failed to load {yaml_file}: {e}")
+
+    def reload_model_config(self, name: str) -> Optional[ModelConfig]:
+        """Re-read a single model yaml from disk. Returns the fresh config,
+        or None if the file no longer exists (in which case the cached entry
+        is removed)."""
+        config_file = self.config_dir / "models.d" / f"{name}.yaml"
+        if not config_file.exists():
+            self._model_configs.pop(name, None)
+            return None
+        try:
+            with open(config_file) as f:
+                data = yaml.safe_load(f)
+            if not data:
+                return self._model_configs.get(name)
+            config = ModelConfig(**data)
+            self._model_configs[config.name] = config
+            return config
+        except Exception as e:
+            print(f"Warning: Failed to reload {config_file}: {e}")
+            return self._model_configs.get(name)
+
+    def reload_all_model_configs(self) -> int:
+        """Re-read every model yaml from models.d/. Returns count loaded."""
+        self._model_configs.clear()
+        self._load_model_configs()
+        return len(self._model_configs)
 
     def get_model_config(self, name: str) -> Optional[ModelConfig]:
         """Get model configuration by name."""
