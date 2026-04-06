@@ -316,14 +316,38 @@ class ProcessManager:
         for model_name in list(self._processes.keys()):
             await self.unload(model_name)
 
+    def _total_loaded_memory_gb(self) -> float:
+        """Sum of estimated memory for all loaded models."""
+        config = get_config()
+        total = 0.0
+        for name in self._processes:
+            mc = config.get_model_config(name)
+            if mc:
+                total += estimate_model_memory_gb(config.models_dir / mc.file)
+        return total
+
     async def _idle_checker(self):
-        """Background task to unload idle models."""
+        """Background task to unload idle models using LRU when memory > 80 GB."""
+        memory_limit_gb = 80.0
+        idle_timeout = 1800  # 30 minutes
+
         while True:
             await asyncio.sleep(60)
             now = time.time()
-            for model_name, rm in list(self._processes.items()):
-                if now - rm.last_used_at > rm.idle_timeout:
-                    print(f"[ProcessManager] Unloading idle model: {model_name}")
+
+            if self._total_loaded_memory_gb() <= memory_limit_gb:
+                continue
+
+            # Sort by least recently used
+            lru_order = sorted(
+                self._processes.items(),
+                key=lambda kv: kv[1].last_used_at,
+            )
+            for model_name, rm in lru_order:
+                if self._total_loaded_memory_gb() <= memory_limit_gb:
+                    break
+                if now - rm.last_used_at > idle_timeout:
+                    print(f"[ProcessManager] Memory pressure: unloading idle model {model_name}")
                     await self.unload(model_name)
 
     async def _read_stdout(self, model_name: str):

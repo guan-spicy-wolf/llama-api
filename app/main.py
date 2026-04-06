@@ -272,11 +272,24 @@ async def proxy_v1(request: Request, path: str):
 
     rm = pm.get_model(model_name)
     if not rm or rm.process.returncode is not None:
-        return Response(
-            content=f'{{"error": "Model \'{model_name}\' not loaded. Load via /api/server/load"}}',
-            status_code=503,
-            media_type="application/json"
-        )
+        # Auto-load the model if it's configured
+        config = get_config()
+        config.reload_model_config(model_name)
+        if not config.get_model_config(model_name):
+            return Response(
+                content=f'{{"error": "Model \'{model_name}\' not found"}}',
+                status_code=404,
+                media_type="application/json",
+            )
+        try:
+            await pm.start(model_name)
+        except Exception as e:
+            return Response(
+                content=f'{{"error": "Failed to auto-load model \'{model_name}\': {e}"}}',
+                status_code=503,
+                media_type="application/json",
+            )
+        rm = pm.get_model(model_name)
 
     # Update last used time
     pm.touch_model(model_name)
