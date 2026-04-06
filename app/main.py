@@ -2,12 +2,14 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import time
+
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 
-from .config import init_config
+from .config import init_config, get_config
 from .routes import models, server
 from .process_manager import get_process_manager
 from .anthropic_adapter import (
@@ -183,6 +185,62 @@ async def anthropic_messages(request: Request):
             status_code=503,
             media_type="application/json"
         )
+
+
+# OpenAI-compatible GET /v1/models — list all configured models with
+# context-length metadata so clients (e.g. Hermes, vLLM-style probes) can
+# discover capabilities without a POST body.
+@app.get("/v1/models")
+async def list_v1_models() -> dict:
+    config = get_config()
+    now = int(time.time())
+    data = []
+    for mc in config.list_model_configs():
+        ctx = None
+        try:
+            ctx = config.get_effective_args(mc.name).ctx_size
+        except Exception:
+            pass
+        entry = {
+            "id": mc.name,
+            "object": "model",
+            "created": now,
+            "owned_by": "llama-api",
+        }
+        if ctx:
+            # Expose under both common keys so vLLM- and LM-Studio-style
+            # clients find it.
+            entry["max_model_len"] = ctx
+            entry["context_length"] = ctx
+        data.append(entry)
+    return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/{model_name}")
+async def get_v1_model(model_name: str):
+    config = get_config()
+    mc = config.get_model_config(model_name)
+    if not mc:
+        return Response(
+            content=f'{{"error": "Model \'{model_name}\' not found"}}',
+            status_code=404,
+            media_type="application/json",
+        )
+    ctx = None
+    try:
+        ctx = config.get_effective_args(mc.name).ctx_size
+    except Exception:
+        pass
+    entry = {
+        "id": mc.name,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "llama-api",
+    }
+    if ctx:
+        entry["max_model_len"] = ctx
+        entry["context_length"] = ctx
+    return entry
 
 
 # Reverse proxy for /v1/* to llama-server
